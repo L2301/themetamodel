@@ -24,7 +24,8 @@ from metrics import p_model_from_qk, kl_p_true_p_model, \
 from train_e1 import generate_experiment_tags
 
 def train_single_config(use_mlp, use_layernorm, markov_type, R_val, r_val, 
-                        num_steps=10000, save_checkpoints=False, output_dir="sweep_results"):
+                        num_steps=10000, save_checkpoints=False, output_dir="sweep_results",
+                        P_true=None, D_torus=None, train_sequences=None, val_sequences=None):
     """
     Train a single configuration and return final metrics.
     
@@ -37,6 +38,10 @@ def train_single_config(use_mlp, use_layernorm, markov_type, R_val, r_val,
         num_steps: Number of training steps
         save_checkpoints: Whether to save model checkpoints
         output_dir: Directory to save results
+        P_true: Pre-computed P_true matrix (optional, will generate if None)
+        D_torus: Pre-computed torus distance matrix (optional, will generate if None)
+        train_sequences: Pre-generated train sequences (optional, will generate if None)
+        val_sequences: Pre-generated val sequences (optional, will generate if None)
     
     Returns:
         dict with final metrics and experiment tags
@@ -59,13 +64,17 @@ def train_single_config(use_mlp, use_layernorm, markov_type, R_val, r_val,
         # Generate tags
         exp_tags = generate_experiment_tags(model, markov_type=markov_type, R_val=R_val, r_val=r_val)
         
-        # Create P_true with overridden config
-        P_true = make_p_true().to(DEVICE)
-        D_torus = torus_pairwise_distances().to(DEVICE)
+        # Create P_true and D_torus if not provided
+        if P_true is None:
+            P_true = make_p_true().to(DEVICE)
+        if D_torus is None:
+            D_torus = torus_pairwise_distances().to(DEVICE)
         
-        # Generate sequences (use smaller sets for sweep)
-        train_sequences = generate_sequences(P_true, N_TRAIN, SEQ_LEN, seed=42)
-        val_sequences = generate_sequences(P_true, N_VAL, SEQ_LEN, seed=43)
+        # Generate sequences if not provided
+        if train_sequences is None:
+            train_sequences = generate_sequences(P_true, N_TRAIN, SEQ_LEN, seed=42)
+        if val_sequences is None:
+            val_sequences = generate_sequences(P_true, N_VAL, SEQ_LEN, seed=43)
         
         train_loader, val_loader = make_dataloaders(
             P_true, BATCH_SIZE,
@@ -303,7 +312,7 @@ def plot_metrics_sweep(metrics_history, save_path, P_true=None):
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-def run_sweep(num_steps=1000, output_dir="sweep_results", radii_only=False):
+def run_sweep(num_steps=10000, output_dir="sweep_results", radii_only=False):
     """
     Run sweep through all configurations.
     
@@ -346,50 +355,102 @@ def run_sweep(num_steps=1000, output_dir="sweep_results", radii_only=False):
     # Results summary
     results_summary = []
     
-    # Progress bar
-    configs = list(itertools.product(mlp_options, ln_options, markov_options, R_options, r_options))
-    pbar = tqdm(configs, desc="Sweeping configurations")
+    # Group configurations by (markov_type, R, r) for dataset reuse
+    # First, get all unique (markov_type, R, r) combinations
+    unique_data_configs = list(itertools.product(markov_options, R_options, r_options))
+    num_unique_data_configs = len(unique_data_configs)
     
-    for use_mlp, use_layernorm, markov_type, R_val, r_val in pbar:
+    # All MLP/LN combinations
+    mlp_ln_configs = list(itertools.product(mlp_options, ln_options))
+    
+    print(f"Dataset optimization:")
+    print(f"  Unique (markov_type, R, r) combinations: {num_unique_data_configs}")
+    print(f"  MLP/LN variations per dataset: {len(mlp_ln_configs)}")
+    print(f"  Sequence generations: {num_unique_data_configs} (vs {total_configs} without optimization)")
+    print(f"  Speedup: {total_configs / num_unique_data_configs:.1f}x for sequence generation\n")
+    
+    # Progress tracking
+    total_configs_processed = 0
+    pbar = tqdm(total=total_configs, desc="Sweeping configurations")
+    
+    # Import config module once
+    import config as config_module
+    
+    # For each unique (markov_type, R, r) combination
+    for markov_type, R_val, r_val in unique_data_configs:
+        # Temporarily override config for dataset generation
+        original_markov_type = config_module.MARKOV_MODEL_TYPE
+        original_R = config_module.R
+        original_r = config_module.r
+        config_module.MARKOV_MODEL_TYPE = markov_type
+        config_module.R = float(R_val)
+        config_module.r = float(r_val)
+        
         try:
-            # Update progress bar
-            exp_tags = f"{'mlp' if use_mlp else 'nomlp'}_{'ln' if use_layernorm else 'noln'}_{markov_type}_R{R_val}r{r_val}"
-            pbar.set_description(f"Training: {exp_tags}")
+            # Generate datasets once for this (markov_type, R, r) combination
+            P_true = make_p_true().to(DEVICE)
+            D_torus = torus_pairwise_distances().to(DEVICE)
+            train_sequences = generate_sequences(P_true, N_TRAIN, SEQ_LEN, seed=42)
+            val_sequences = generate_sequences(P_true, N_VAL, SEQ_LEN, seed=43)
             
-            # Train configuration
-            result = train_single_config(
-                use_mlp=use_mlp,
-                use_layernorm=use_layernorm,
-                markov_type=markov_type,
-                R_val=float(R_val),
-                r_val=float(r_val),
-                num_steps=num_steps,
-                output_dir=output_dir
-            )
-            
-            # Save metrics JSON
-            metrics_file = os.path.join(output_dir, f"metrics_{exp_tags}.json")
-            with open(metrics_file, 'w') as f:
-                json.dump(result['metrics_history'], f, indent=2)
-            
-            # Generate and save plot
-            plot_file = os.path.join(output_dir, f"plot_{exp_tags}.png")
-            plot_metrics_sweep(result['metrics_history'], plot_file, P_true=result['P_true'])
-            
-            # Add to summary
-            results_summary.append({
-                'exp_tags': exp_tags,
-                'config': result['metrics_history']['config'],
-                'final_metrics': result['final_metrics'],
-                'metrics_file': metrics_file,
-                'plot_file': plot_file
-            })
-            
-        except Exception as e:
-            print(f"\nError in configuration {exp_tags}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+            # Now train all MLP/LN variations with these shared datasets
+            for use_mlp, use_layernorm in mlp_ln_configs:
+                try:
+                    # Update progress bar
+                    exp_tags = f"{'mlp' if use_mlp else 'nomlp'}_{'ln' if use_layernorm else 'noln'}_{markov_type}_R{R_val}r{r_val}"
+                    pbar.set_description(f"Training: {exp_tags}")
+                    
+                    # Train configuration with pre-generated datasets
+                    result = train_single_config(
+                        use_mlp=use_mlp,
+                        use_layernorm=use_layernorm,
+                        markov_type=markov_type,
+                        R_val=float(R_val),
+                        r_val=float(r_val),
+                        num_steps=num_steps,
+                        output_dir=output_dir,
+                        P_true=P_true,
+                        D_torus=D_torus,
+                        train_sequences=train_sequences,
+                        val_sequences=val_sequences
+                    )
+                    
+                    # Save metrics JSON
+                    metrics_file = os.path.join(output_dir, f"metrics_{exp_tags}.json")
+                    with open(metrics_file, 'w') as f:
+                        json.dump(result['metrics_history'], f, indent=2)
+                    
+                    # Generate and save plot
+                    plot_file = os.path.join(output_dir, f"plot_{exp_tags}.png")
+                    plot_metrics_sweep(result['metrics_history'], plot_file, P_true=P_true)
+                    
+                    # Add to summary
+                    results_summary.append({
+                        'exp_tags': exp_tags,
+                        'config': result['metrics_history']['config'],
+                        'final_metrics': result['final_metrics'],
+                        'metrics_file': metrics_file,
+                        'plot_file': plot_file
+                    })
+                    
+                    total_configs_processed += 1
+                    pbar.update(1)
+                    
+                except Exception as e:
+                    print(f"\nError in configuration {exp_tags}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    total_configs_processed += 1
+                    pbar.update(1)
+                    continue
+        
+        finally:
+            # Restore original config
+            config_module.MARKOV_MODEL_TYPE = original_markov_type
+            config_module.R = original_R
+            config_module.r = original_r
+    
+    pbar.close()
     
     # Save summary
     summary_file = os.path.join(output_dir, "sweep_summary.json")
@@ -402,6 +463,11 @@ def run_sweep(num_steps=1000, output_dir="sweep_results", radii_only=False):
     print(f"Results saved to: {output_dir}")
     print(f"Summary: {summary_file}")
     print(f"Total configurations completed: {len(results_summary)}/{total_configs}")
+    print(f"\nOptimization Summary:")
+    print(f"  Unique dataset generations: {num_unique_data_configs}")
+    print(f"  Total configurations: {total_configs}")
+    print(f"  Dataset reuse factor: {total_configs / num_unique_data_configs:.1f}x")
+    print(f"  Estimated time saved: ~{(total_configs - num_unique_data_configs) * 0.1:.1f}s (assuming 0.1s per sequence generation)")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
