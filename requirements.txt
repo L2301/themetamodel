@@ -1,0 +1,15 @@
+# Core dependencies for E1 Torus Experiment
+
+# PyTorch - deep learning framework
+torch>=2.0.0
+
+# Data visualization (for eval.py)
+matplotlib>=3.5.0
+numpy>=1.21.0
+
+# Testing (optional, for running unit tests)
+pytest>=7.0.0
+
+# Progress bars
+tqdm>=4.64.0
+
