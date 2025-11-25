@@ -486,7 +486,7 @@ Examples:
   python sweep_e1.py --radii-only --num-steps 500
         """
     )
-    parser.add_argument('--num-steps', type=int, default=1000,
+    parser.add_argument('--num-steps', type=int, default=10000,
                         help='Number of training steps per configuration (default: 1000)')
     parser.add_argument('--output-dir', type=str, default='sweep_results',
                         help='Output directory for results (default: sweep_results)')
